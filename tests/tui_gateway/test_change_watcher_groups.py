@@ -214,7 +214,7 @@ def test_live_status_never_waits_for_the_policy_lock(tmp_path):
     held.wait(5)
     reader = threading.Thread(target=lambda: result.setdefault("sig", service.live_status_sig()), daemon=True)
     reader.start()
-    reader.join(1.0)
+    reader.join(2.0)  # tests/AGENTS.md: wall-clock bounds >= 2 s; the holder waits 5 s
     waited = reader.is_alive()  # read while the lock is still held
     done.set()
     holder.join(5)

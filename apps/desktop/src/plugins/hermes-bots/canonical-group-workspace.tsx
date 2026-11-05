@@ -110,33 +110,25 @@ function CanonicalRoomView({ binding: initialBinding, visible, onBack }: {
   const applied = useRef<RoomEvent[]>([])
   const changeEvents = useRef(false)
 
-  // One room read at a time for every caller (poll, push, a mutation's settle, Refresh, settings saved): a
-  // call landing mid-read waits for it and runs one more after it, so none is lost and no two overlap.
-  const reading = useRef<{ current: Promise<void>; again: boolean } | null>(null)
+  // One room read at a time for every caller (poll, push, a mutation's settle, Refresh, settings saved). A call
+  // during a read queues ONE read after it (shared by every caller that lands meanwhile) and resolves when that
+  // read ends, so a caller never waits for a busy room to fall quiet and no two reads overlap.
+  const reading = useRef<{ current: Promise<void>; next?: Promise<void> } | null>(null)
 
   const refresh = (): Promise<void> => {
     const flight = reading.current
 
     if (flight) {
-      flight.again = true
+      flight.next ??= flight.current.catch(() => undefined).then(() => refresh())
 
-      return flight.current
+      return flight.next
     }
 
-    const next = { current: Promise.resolve(), again: false }
-    next.current = (async () => {
-      try {
-        do {
-          next.again = false
-          await readRoom()
-        } while (next.again && alive.current)
-      } finally {
-        reading.current = null
-      }
-    })()
-    reading.current = next
+    const read: { current: Promise<void>; next?: Promise<void> } = { current: Promise.resolve() }
+    read.current = readRoom().finally(() => { if (reading.current === read) {reading.current = null} })
+    reading.current = read
 
-    return next.current
+    return read.current
   }
 
   const readRoom = async () => {
@@ -195,10 +187,11 @@ function CanonicalRoomView({ binding: initialBinding, visible, onBack }: {
     }
 
     // groups.changed only reaches this window over an open socket to the room's backend; a secondary
-    // route's socket otherwise closes between reads, and the slow backstop would then be the only update.
-    const release = typeof host.retainProfileSocket === 'function'
-      ? host.retainProfileSocket(canonicalGroupProfileRoute(binding))
-      : undefined
+    // route's socket (a local room under a remote primary, too) otherwise closes between reads, and the
+    // slow backstop would then be the only update. A lease that lands after the view closed is let go.
+    let release: (() => void) | undefined
+    void (typeof host.retainProfile === 'function' ? host.retainProfile(canonicalGroupProfileRoute(binding)) : Promise.resolve(undefined))
+      .then(lease => { if (cancelled) {lease?.()} else {release = lease} }, () => undefined)
 
     // An untagged event may come from any route (the local/legacy primary), so it refreshes too; one
     // naming rooms refreshes only their views (no list: something process-wide moved).

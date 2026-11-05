@@ -240,15 +240,24 @@ it('holds the room route\'s socket open while the view is shown, so its pushes a
   serveRoom({ log: [message(1)], changeEvents: true })
   const sdk = await import('@hermes/plugin-sdk')
   const released = vi.fn()
-  const retain = vi.fn(() => released)
-  Object.assign(sdk.host, { retainProfileSocket: retain })
+  const retain = vi.fn(async (): Promise<() => void> => released)
+  Object.assign(sdk.host, { retainProfile: retain })
   const view = render(<CanonicalGroupWorkspace binding={binding} />)
   await screen.findByText('m1')
   expect(retain).toHaveBeenCalledWith({ connectionId: 'local', profile: 'team', targetProfile: 'team', mode: 'local' })
   expect(released).not.toHaveBeenCalled()
   view.unmount()
   expect(released).toHaveBeenCalledTimes(1)
-  delete (sdk.host as { retainProfileSocket?: unknown }).retainProfileSocket
+
+  // A lease that resolves only after the view closed is released at once.
+  let grant!: (release: () => void) => void
+  const late = vi.fn()
+  retain.mockImplementationOnce(() => new Promise(resolve => { grant = resolve }))
+  const again = render(<CanonicalGroupWorkspace binding={binding} />)
+  again.unmount()
+  await act(async () => { grant(late) })
+  expect(late).toHaveBeenCalledTimes(1)
+  delete (sdk.host as { retainProfile?: unknown }).retainProfile
 })
 
 it('refuses a page that says there is more but moves the cursor nowhere, instead of spinning or stopping short', async () => {
@@ -258,4 +267,43 @@ it('refuses a page that says there is more but moves the cursor nowhere, instead
   render(<CanonicalGroupWorkspace binding={binding} />)
   expect(await screen.findByRole('alert')).toBeTruthy()
   expect(logReads()).toEqual([0])
+})
+
+it('re-enables the room controls after an action even while pushes keep the room busy', async () => {
+  const room = { log: [message(1)], changeEvents: true }
+  serveRoom(room)
+  const serve = request.getMockImplementation()!
+  let storm = false
+  let reads = 0
+  // While the storm runs, every state read is slow and every read is followed by another push: the room never
+  // falls quiet, so a settle that waited for the whole queue would never return.
+  request.mockImplementation(async (...args: Parameters<typeof serve>) => {
+    if (args[1] === 'groups.state') {
+      return { ...(await serve(...args)) as object, driver_status: { working: true, member_activity: [] } }
+    }
+
+    if (args[1] === 'groups.stop') {return {}}
+
+    return serve(...args)
+  })
+  const base = request.getMockImplementation()!
+  request.mockImplementation(async (...args: Parameters<typeof base>) => {
+    if (storm && args[1] === 'groups.state') {
+      reads++
+      await new Promise(resolve => setTimeout(resolve, 15))
+      setTimeout(() => { if (storm) {emit('groups.changed', { connectionId: 'local' })} }, 0)
+    }
+
+    return base(...args)
+  })
+  render(<CanonicalGroupWorkspace binding={binding} />)
+  await screen.findByText('m1')
+  const stop = await screen.findByRole('button', { name: 'Stop the group' })
+  storm = true
+  emit('groups.changed', { connectionId: 'local' })
+  fireEvent.click(stop)
+  await waitFor(() => expect(screen.getByRole('button', { name: 'Stop the group' })).toBeTruthy(), { timeout: 3000 })
+  const during = reads
+  storm = false
+  expect(during).toBeGreaterThan(0)
 })
