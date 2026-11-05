@@ -1,4 +1,4 @@
-"""``groups.changed``: the change watcher's push for an open Group Chat (plan step 2, ``tla/RoomFeed.tla``).
+"""``groups.changed``: the change watcher's push for an open Group Chat (plan step 2).
 
 The room view re-reads its log delta and ``groups.state`` on this signal and keeps a slow poll as the
 backstop, so the signal must move whenever either answer would: a log append from any process (a cron post,
@@ -239,3 +239,34 @@ def test_a_room_service_lists_retry_before_the_approval_cards(tmp_path):
         SimpleNamespace(_methods={}, _sessions={}, _sessions_lock=threading.Lock()), db_path=db)
     service._set_pending_action("room-1", "ops", {"kind": "approval", "task_id": "t9", "request_id": "r9"})
     assert [action["kind"] for action in service.status("room-1")["pending_actions"]] == ["retry", "approval"]
+
+
+def test_a_store_only_a_room_service_names_is_watched(room_watch, tmp_path):
+    """A multiplexing gateway's secondary authority keeps its rooms in its own home's state.db, which is
+    neither the watcher home's store nor the shared one: the service registry is how the watcher finds it."""
+    _shared, tick, services, _events = room_watch
+    store = tmp_path / "secondary" / "state.db"
+    store.parent.mkdir()
+    rooms.create_room(store, room_id="room-9", name="Room", members=[{"profile": "ops", "handle": "ops"}],
+                      authority_gateway_id="gateway-a", now=10)
+    service = _Service(store)
+    services.append(service)
+    seen = len(tick())
+    _post(store, 1, "room-9")
+    assert tick()[seen:] == [{"room_ids": ["room-9"]}]
+    assert service.wakes == 1
+
+
+def test_a_room_service_starting_or_stopping_moves_its_live_signature(tmp_path):
+    """groups.state drops driver_status while the room service is not running (session_group_controls._group),
+    and no store write marks that: the worker's run state is the part of the signature that moves."""
+    service = hosted_room_service.HostedRoomService(
+        SimpleNamespace(_methods={}, _sessions={}, _sessions_lock=threading.Lock()), db_path=tmp_path / "state.db")
+    idle = service.live_status_sig()
+    service.start()
+    try:
+        running = service.live_status_sig()
+    finally:
+        assert service.stop(timeout=5)
+    assert running[""] != idle[""]
+    assert service.live_status_sig() == idle

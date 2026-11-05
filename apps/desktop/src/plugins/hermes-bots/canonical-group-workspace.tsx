@@ -177,12 +177,17 @@ function CanonicalRoomView({ binding: initialBinding, visible, onBack }: {
 
     // refresh() owns the one-read-at-a-time rule; the poll only reschedules itself after each read.
     const poll = async () => {
-      try { await refresh() } catch (e) { if (!cancelled) {setReadError(String(e instanceof Error ? e.message : e))} }
+      let failed = false
 
-      // Every read ends by (re)arming the one timer; a push mid-wait restarts the wait.
+      try { await refresh() } catch (e) { failed = true;
+
+ if (!cancelled) {setReadError(String(e instanceof Error ? e.message : e))} }
+
+      // Every read ends by (re)arming the one timer; a push mid-wait restarts the wait. A failed read (the route
+      // is down, so its pushes are lost too) retries on the fast poll, as main did, not the backstop.
       if (!cancelled) {
         clearTimeout(timer)
-        timer = setTimeout(() => void poll(), changeEvents.current ? ROOM_BACKSTOP_MS : ROOM_POLL_MS)
+        timer = setTimeout(() => void poll(), changeEvents.current && !failed ? ROOM_BACKSTOP_MS : ROOM_POLL_MS)
       }
     }
 
@@ -205,9 +210,18 @@ function CanonicalRoomView({ binding: initialBinding, visible, onBack }: {
       })
       : undefined
 
+    // A reconnect loses every push sent while the route's socket was down: re-read now, not at the backstop.
+    const unsubscribeReady = typeof host.onEvent === 'function'
+      ? host.onEvent('gateway.ready', event => {
+        const source = String((event as { connectionId?: string }).connectionId || '')
+
+        if (!cancelled && (!source || source === binding.connectionId)) {void poll()}
+      })
+      : undefined
+
     void poll()
 
-    return () => { cancelled = true; revision.current++; clearTimeout(timer); unsubscribe?.(); release?.() }
+    return () => { cancelled = true; revision.current++; clearTimeout(timer); unsubscribe?.(); unsubscribeReady?.(); release?.() }
     // The keyed parent freezes the authority binding for this lifetime.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [visible])

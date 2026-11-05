@@ -4,7 +4,7 @@ import { atom } from 'nanostores'
 import type { ComponentProps } from 'react'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 
-// The room view follows the room log the way tla/RoomFeed.tla models it: it reads only after its cursor,
+// The room view follows the room log by this contract: it reads only after its cursor,
 // applies a page only from cursor+1 (the view stays a prefix of the log), refreshes on groups.changed, and
 // keeps a slow poll because a push can be lost.
 const request = vi.hoisted(() => vi.fn())
@@ -306,4 +306,38 @@ it('re-enables the room controls after an action even while pushes keep the room
   const during = reads
   storm = false
   expect(during).toBeGreaterThan(0)
+})
+
+it('re-reads at once when its route reconnects, since the pushes sent while the socket was down are lost', async () => {
+  const room = { log: [message(1)], changeEvents: true }
+  serveRoom(room)
+  render(<CanonicalGroupWorkspace binding={binding} />)
+  await screen.findByText('m1')
+  room.log.push(message(2))  // appended while the socket was down: its groups.changed never arrived
+
+  const stateReads = () => request.mock.calls.filter(call => call[1] === 'groups.state').length
+  const reads = stateReads()
+  emit('gateway.ready', { connectionId: 'other-machine' })
+  expect(stateReads()).toBe(reads)
+  emit('gateway.ready', { connectionId: 'local' })
+  expect(stateReads()).toBe(reads + 1)  // the read starts now, not at the 15 s backstop
+  await screen.findByText('m2')
+})
+
+it('retries a failed read on the fast poll, not the backstop, even on a backend that pushes', async () => {
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+  const room = { log: [message(1)], changeEvents: true }
+  serveRoom(room)
+  render(<CanonicalGroupWorkspace binding={binding} />)
+  await vi.waitFor(() => expect(screen.getByText('m1')).toBeTruthy())
+  const serve = request.getMockImplementation()!
+  let down = true
+  request.mockImplementation(async (...args: Parameters<typeof serve>) =>
+    down && args[1] === 'groups.state' ? Promise.reject(new Error('socket closed')) : serve(...args))
+  emit('groups.changed', { connectionId: 'local' })              // the read that finds the route down
+  await act(async () => { await vi.advanceTimersByTimeAsync(10) })
+  down = false
+  room.log.push(message(2))
+  await act(async () => { await vi.advanceTimersByTimeAsync(2100) })  // one fast poll, far short of 15 s
+  expect(screen.getByText('m2')).toBeTruthy()
 })
