@@ -27,7 +27,7 @@ class HostedControls:
         return task, HostedRoomBinding(room_id, gateway, epoch)
 
     def discard_room_task(self, room_id, *, member_id, task_id, execution_generation):
-        with self._policy_lock:
+        with self._room_prepare_lock(room_id):
             task, binding = self._control_task(room_id, member_id, task_id, execution_generation)
             cancel_id = f'discard:{execution_generation}'
             if task['status'] == 'cancelled' and task.get('cancel_id') == cancel_id:
@@ -52,7 +52,7 @@ class HostedControls:
             # A stalled room preparation, not an attempt: the shared service retries it.
             return super().retry_room_task(
                 room_id, task_id=task_id, member_id=member_id, execution_generation=execution_generation)
-        with self._policy_lock:
+        with self._room_prepare_lock(room_id):
             task, binding = self._control_task(room_id, member_id, task_id, execution_generation)
             # Unknown is not non-admission. Never advance its hosted generation
             # while leaving the canonical unknown head behind it.

@@ -139,7 +139,11 @@ class HostedRoomService:
         # before Stop marks its attempt stopping, or sees the stop and is refused. Taken before
         # ``_policy_lock``, never inside it.
         self._approval_stop_lock = threading.RLock()
+        # One room's slow log/checkpoint work holds only that room's lock. Room-scoped mutations
+        # (prepare, Stop, Discard, route and Continue writes) take it BEFORE ``_policy_lock``, which
+        # guards only in-memory maps, so status reads never wait behind another room's SQLite work.
         self._prepare_locks: weakref.WeakValueDictionary[str, Any] = weakref.WeakValueDictionary()
+        self._prepare_locks_guard = threading.Lock()
         self._pending_actions: dict[tuple[str, str], dict[str, Any]] = {}
         self.policy_checkpoint = HostedRoomPolicyCheckpoint(
             self.db_path,
@@ -501,7 +505,7 @@ class HostedRoomService:
             authority_gateway_id=gateway_id, authority_epoch=epoch)
 
     def _room_prepare_lock(self, room_id: str):
-        with self._policy_lock:
+        with self._prepare_locks_guard:
             lock = self._prepare_locks.get(room_id)
             if lock is None:
                 lock = threading.RLock()
@@ -587,7 +591,7 @@ class HostedRoomService:
         without the policy lock, so the write carries the log position the plan was read at and a changed
         log re-plans instead of recording a route over a Stop."""
         for _attempt in range(_FENCED_APPEND_ATTEMPTS):
-            with self._policy_lock:
+            with self._room_prepare_lock(binding.room_id):
                 room = self._room(binding.room_id)
                 snapshot = self._policy_snapshot(room)
                 current = discussion.plan_next_task(
@@ -615,7 +619,7 @@ class HostedRoomService:
     def continue_room(self, room_id: str, *, discussion_event_id: str) -> dict[str, Any]:
         """The user's Continue on a discussion paused at its cap: one more budget of rounds and messages."""
         gateway_id, epoch = self._owned_authority(room_id)
-        with self._policy_lock:
+        with self._room_prepare_lock(room_id):
             event = self._append_continue(room_id, discussion_event_id, gateway_id, epoch)
         self._prepare_stalls.clear(room_id)
         binding = next((b for b in self.bindings() if b.room_id == room_id), None)
@@ -723,7 +727,7 @@ class HostedRoomService:
             self.db_path, room_id=room_id, cancel_id=cancel_id, expected_gateway_id=gateway_id,
             expected_epoch=epoch)
         pending = 0
-        with self._policy_lock:
+        with self._room_prepare_lock(room_id):
             tasks = {
                 (task["identity"].room_id, task["identity"].task_id): task
                 for task in self._list_tasks(room_id, _STOPPABLE_STATUSES)
@@ -732,9 +736,10 @@ class HostedRoomService:
                 if require_acknowledged or int(task["payload"]["source_event_seq"]) < int(fence["seq"])}
             # A stopped attempt's approval is spent: a concurrent Allow waiting on the lock finds nothing.
             stopped = {(task["identity"].task_id, task.get("execution_generation")) for task in tasks.values()}
-            for key in [key for key, action in self._pending_actions.items() if key[0] == room_id
-                        and (action.get("task_id"), action.get("execution_generation")) in stopped]:
-                self._pending_actions.pop(key, None)
+            with self._policy_lock:
+                for key in [key for key, action in self._pending_actions.items() if key[0] == room_id
+                            and (action.get("task_id"), action.get("execution_generation")) in stopped]:
+                    self._pending_actions.pop(key, None)
             for task in tasks.values():
                 own_cancel_id = (
                     task.get("status") == "stopping" and str(task.get("cancel_id") or ""))

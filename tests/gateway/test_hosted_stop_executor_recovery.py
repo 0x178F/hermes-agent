@@ -171,6 +171,50 @@ def test_slow_room_checkpoint_does_not_block_status_or_another_rooms_stop(mux, m
 
 
 @pytest.mark.platforms('linux')
+def test_stop_waiting_on_a_slow_room_does_not_block_status(mux, monkeypatch):
+    """A Stop that republishes the room (a settled receipt) queues behind its room's slow
+    checkpoint without holding the lock every room's status read needs."""
+    service, binding, _, _, _ = _seed_old_stopping_cross_profile_task(mux, 'slow-stop-room')
+    entered, release = threading.Event(), threading.Event()
+    original = service.policy_checkpoint.snapshot
+
+    def slow_snapshot(**kwargs):
+        if not entered.is_set():
+            entered.set()
+            assert release.wait(10)
+        return original(**kwargs)
+
+    stop_waiting = threading.Event()
+    room_lock = service._room_prepare_lock
+
+    def observed_room_lock(room_id):
+        if threading.current_thread().name.startswith('stop_'):
+            stop_waiting.set()
+        return room_lock(room_id)
+
+    def cancel_with_receipt(identity, *, cancel_id):
+        task = tasks.get_task(service.db_path, identity)
+        service.publish_terminal(binding, task)  # what a stop that finds a receipt does
+        return task
+
+    from gateway import hosted_room_driver as tasks
+    monkeypatch.setattr(service.policy_checkpoint, 'snapshot', slow_snapshot)
+    monkeypatch.setattr(service.runtime, 'cancel', cancel_with_receipt)
+    monkeypatch.setattr(service, '_room_prepare_lock', observed_room_lock)
+    with ThreadPoolExecutor(max_workers=2) as pool, ThreadPoolExecutor(1, 'stop') as stops:
+        preparing = pool.submit(service.prepare_room, binding)
+        assert entered.wait(5)
+        try:
+            stopping = stops.submit(service.stop_room, binding.room_id, cancel_id='second-stop')
+            assert stop_waiting.wait(5)  # Stop now waits for the room the checkpoint holds
+            assert pool.submit(service.status, binding.room_id).result(timeout=3)['working'] is True
+        finally:
+            release.set()
+            preparing.result(timeout=5)
+            stopping.result(timeout=10)
+
+
+@pytest.mark.platforms('linux')
 def test_saved_stop_finishes_before_slow_preparation_of_its_own_room(mux, monkeypatch):
     from gateway import hosted_room_driver as tasks
 
