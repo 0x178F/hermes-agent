@@ -120,15 +120,41 @@ export function looksLikeDroppedPath(text: string): boolean {
   return false
 }
 
+/** The draft an in-flight paste or attach was started on. */
+interface DraftMark {
+  revision: number
+}
+
 export function useComposerState({ gw, submitRef, sys }: UseComposerStateOptions): UseComposerStateResult {
   const [input, setInputState] = useState('')
   const [inputBuf, setInputBufState] = useState<string[]>([])
+  // Bumped by every edit except a paste or attach result landing: a sibling
+  // paste's own insert must not read as the user editing the draft away.
   const composerRevision = useRef(0)
+  // Inserts results made on the current revision, in landing order, so a
+  // later result moves its insertion point past the ones that landed first.
+  const landings = useRef<Array<{ at: number; len: number }>>([])
+  // The value a result's landing is about to write, so setInput knows it as its own.
+  const landingValue = useRef<null | string>(null)
+  // Tokens added by a result that has not landed in the text yet.
+  const unlanded = useRef(new Set<ComposerToken>())
+
+  const bumpRevision = useCallback(() => {
+    composerRevision.current++
+    landings.current = []
+  }, [])
+
+  const captureDraft = useCallback(
+    (): DraftMark => ({ revision: composerRevision.current }),
+    []
+  )
+
+  const isFresh = useCallback((draft: DraftMark) => draft.revision === composerRevision.current, [])
 
   const setInputBuf = useCallback<StateSetter<string[]>>(next => {
-    composerRevision.current++
+    bumpRevision()
     setInputBufState(next)
-  }, [])
+  }, [bumpRevision])
 
   const [tokens, setTokens] = useState<ComposerToken[]>([])
   // Tokens and the input line are read from keystroke handlers that run several
@@ -148,16 +174,21 @@ export function useComposerState({ gw, submitRef, sys }: UseComposerStateOptions
   }, [])
 
   const setInput = useCallback<StateSetter<string>>(next => {
-    composerRevision.current++
     const prev = inputRef.current
     inputRef.current = typeof next === 'function' ? next(prev) : next
+
+    if (inputRef.current !== landingValue.current) {
+      bumpRevision()
+    }
+
+    landingValue.current = null
 
     if (pasteSpanRef.current) {
       setPasteSpan(shiftSpan(prev, inputRef.current, pasteSpanRef.current))
     }
 
     setInputState(inputRef.current)
-  }, [setPasteSpan])
+  }, [bumpRevision, setPasteSpan])
 
   const setComposerTokens = useCallback<StateSetter<ComposerToken[]>>(next => {
     tokensRef.current = typeof next === 'function' ? next(tokensRef.current) : next
@@ -256,7 +287,9 @@ export function useComposerState({ gw, submitRef, sys }: UseComposerStateOptions
    */
   const syncTokens = useCallback(
     (value: string) => {
-      const gone = droppedTokens(tokensRef.current, value)
+      // A sibling result landing first leaves this one's token textless for a moment.
+      const own = value === landingValue.current
+      const gone = droppedTokens(tokensRef.current, value).filter(token => !(own && unlanded.current.has(token)))
 
       if (!gone.length) {
         return
@@ -268,9 +301,74 @@ export function useComposerState({ gw, submitRef, sys }: UseComposerStateOptions
         }
       }
 
+      gone.forEach(token => unlanded.current.delete(token))
       setComposerTokens(prev => prev.filter(token => !gone.includes(token)))
     },
     [gw, setComposerTokens]
+  )
+
+  const discardToken = useCallback(
+    (token: ComposerToken) => {
+      setComposerTokens(prev => prev.filter(t => t !== token))
+      const shared = tokensRef.current.some(t => t.kind === 'image' && t.path === token.path)
+
+      if (token.kind === 'image' && !shared && !gw.isCanonical) {
+        void gw.request('image.detach', { path: token.path, session_id: getUiState().sid }).catch(() => {})
+      }
+    },
+    [gw, setComposerTokens]
+  )
+
+  /**
+   * A result inserting `text` at `cursor` of the draft it started on. Other
+   * results may land on that draft first, so `land` re-places the insertion on
+   * the value it is about to be written to, after those earlier insertions, and
+   * refuses once anything else edited the draft. `spaced` pads it off its
+   * neighbours like a chip; raw text goes in verbatim.
+   */
+  const insertLanding = useCallback(
+    (draft: DraftMark, value: string, cursor: number, text: string, spaced: boolean, token?: ComposerToken) => {
+      const insert = (into: string, at: number) =>
+        spaced ? insertAtCursor(into, at, text) : { cursor: at + text.length, value: into.slice(0, at) + text + into.slice(at) }
+
+      if (token) {
+        unlanded.current.add(token)
+      }
+
+      const land = (current: string, caret = current.length): ComposerPasteResult | null => {
+        if (token) {
+          unlanded.current.delete(token)
+        }
+
+        if (!isFresh(draft)) {
+          // Nothing will show this chip now, so it must not ride along either.
+          if (token) {
+            discardToken(token)
+          }
+
+          return null
+        }
+
+        // After whatever landed at or before this point first: chips read in the
+        // order they were numbered, which is the order their images reach the model.
+        const at = Math.min(
+          current.length,
+          landings.current.reduce((pos, prior) => (prior.at <= pos ? pos + prior.len : pos), cursor)
+        )
+
+        const next = insert(current, at)
+        const len = next.value.length - current.length
+
+        landings.current.push({ at, len })
+        landingValue.current = next.value
+
+        // The caret stays with the user's text when the insert landed behind it.
+        return { cursor: Math.max(caret, at) + len, value: next.value }
+      }
+
+      return { ...insert(value, cursor), land }
+    },
+    [discardToken, isFresh]
   )
 
   /**
@@ -280,6 +378,7 @@ export function useComposerState({ gw, submitRef, sys }: UseComposerStateOptions
    */
   const attachImageToken = useCallback(
     (
+      draft: DraftMark,
       attached: ImageAttachResponse & { path?: string; mime?: string },
       value: string,
       cursor: number
@@ -287,19 +386,21 @@ export function useComposerState({ gw, submitRef, sys }: UseComposerStateOptions
       const index = nextImageIndex(tokensRef.current)
       const label = imageToken(index)
 
-      setComposerTokens(prev =>
-        trimTokens([
-          ...prev,
-          { index, kind: 'image', label, path: attached.path ?? '', ...(attached.mime ? { mime: attached.mime } : {}) }
-        ])
-      )
+      const token: ComposerToken = {
+        index,
+        kind: 'image',
+        label,
+        path: attached.path ?? '',
+        ...(attached.mime ? { mime: attached.mime } : {})
+      }
 
-      const withToken = insertAtCursor(value, cursor, label)
+      setComposerTokens(prev => trimTokens([...prev, token]))
+
       const remainder = attached.remainder?.trim() ?? ''
 
-      return remainder ? insertAtCursor(withToken.value, withToken.cursor, remainder) : withToken
+      return insertLanding(draft, value, cursor, remainder ? `${label} ${remainder}` : label, true, token)
     },
-    [setComposerTokens]
+    [insertLanding, setComposerTokens]
   )
 
   const attachmentFlights = useRef(0)
@@ -308,7 +409,7 @@ export function useComposerState({ gw, submitRef, sys }: UseComposerStateOptions
   const resolveAttachment = useCallback(
     async <T extends { path?: string }>(
       destination: SubmissionDestination,
-      revision: number,
+      draft: DraftMark,
       request: Promise<T | null>,
       accept: (attached: T | null) => ComposerPasteResult | null
     ): Promise<ComposerPasteResult | null> => {
@@ -317,7 +418,7 @@ export function useComposerState({ gw, submitRef, sys }: UseComposerStateOptions
       try {
         const attached = await request
 
-        if (isCurrentDestination(destination) && revision === composerRevision.current) {
+        if (isCurrentDestination(destination) && isFresh(draft)) {
           return accept(attached)
         }
 
@@ -345,7 +446,7 @@ export function useComposerState({ gw, submitRef, sys }: UseComposerStateOptions
         }
       }
     },
-    [gw]
+    [gw, isFresh]
   )
 
   /**
@@ -358,7 +459,7 @@ export function useComposerState({ gw, submitRef, sys }: UseComposerStateOptions
   const pasteClipboardImage = useCallback(
     async (value: string, cursor: number, quiet: boolean): Promise<ComposerPasteResult | null> => {
       const destination = captureDestination()
-      const revision = composerRevision.current
+      const draft = captureDraft()
       const { sid } = destination
 
       if (!sid) {
@@ -367,7 +468,7 @@ export function useComposerState({ gw, submitRef, sys }: UseComposerStateOptions
 
       return resolveAttachment<ClipboardPasteResponse & { path?: string; mime?: string }>(
         destination,
-        revision,
+        draft,
         (gw.isCanonical
           ? stageClipboardImage(gw, destination).then(image => (image ? { ...image, attached: true } : null))
           : gw.request<ClipboardPasteResponse & { path?: string; mime?: string }>('clipboard.paste', {
@@ -382,7 +483,7 @@ export function useComposerState({ gw, submitRef, sys }: UseComposerStateOptions
         }),
         r => {
           if (r?.attached) {
-            return attachImageToken(r, value, cursor)
+            return attachImageToken(draft, r, value, cursor)
           }
 
           if (!quiet) {
@@ -393,13 +494,14 @@ export function useComposerState({ gw, submitRef, sys }: UseComposerStateOptions
         }
       )
     },
-    [attachImageToken, gw, resolveAttachment, sys]
+    [attachImageToken, captureDraft, gw, resolveAttachment, sys]
   )
 
   const handleResolvedPaste = useCallback(
     async ({ bracketed, cursor, text, value }: Omit<PasteEvent, 'hotkey'>): Promise<ComposerPasteResult | null> => {
       const destination = captureDestination()
-      const revision = composerRevision.current
+      const draft = captureDraft()
+      const current = () => isCurrentDestination(destination) && isFresh(draft)
       const cleanedText = stripTrailingPasteNewlines(text)
 
       if (!cleanedText || !/[^\n]/.test(cleanedText)) {
@@ -412,14 +514,14 @@ export function useComposerState({ gw, submitRef, sys }: UseComposerStateOptions
         try {
           const next = await resolveAttachment<ImageAttachResponse & { path?: string; mime?: string }>(
             destination,
-            revision,
+            draft,
             gw.isCanonical
               ? stageImagePath(cleanedText, gw, destination)
               : gw.request<ImageAttachResponse & { path?: string }>('image.attach', {
                   path: cleanedText,
                   session_id: sid
                 }),
-            attached => (attached?.name ? attachImageToken(attached, value, cursor) : null)
+            attached => (attached?.name ? attachImageToken(draft, attached, value, cursor) : null)
           )
 
           if (next) {
@@ -429,7 +531,7 @@ export function useComposerState({ gw, submitRef, sys }: UseComposerStateOptions
           // Fall back to generic file-drop detection below.
         }
 
-        if (!(isCurrentDestination(destination) && revision === composerRevision.current)) {
+        if (!current()) {
           return null
         }
 
@@ -439,19 +541,19 @@ export function useComposerState({ gw, submitRef, sys }: UseComposerStateOptions
             text: cleanedText
           })
 
-          if (!(isCurrentDestination(destination) && revision === composerRevision.current)) {
+          if (!current()) {
             return null
           }
 
           if (dropped?.matched && dropped.text) {
-            return insertAtCursor(value, cursor, dropped.text)
+            return insertLanding(draft, value, cursor, dropped.text, true)
           }
         } catch {
           // Fall through to normal text paste behavior.
         }
       }
 
-      if (!(isCurrentDestination(destination) && revision === composerRevision.current)) {
+      if (!current()) {
         return null
       }
 
@@ -460,17 +562,13 @@ export function useComposerState({ gw, submitRef, sys }: UseComposerStateOptions
       // Inside an expanded paste the text joins it: a chip there would fold
       // into the outer paste as its label, not its content.
       if (insideSpan(pasteSpanRef.current, cursor) || !shouldCollapsePaste(cleanedText, lineCount)) {
-        return {
-          cursor: cursor + cleanedText.length,
-          value: value.slice(0, cursor) + cleanedText + value.slice(cursor)
-        }
+        return insertLanding(draft, value, cursor, cleanedText, false)
       }
 
       const label = pasteTokenLabel(cleanedText, lineCount)
-      const inserted = insertAtCursor(value, cursor, label)
-
       const token: ComposerToken = { kind: 'paste', label, text: cleanedText }
       setComposerTokens(prev => trimTokens([...prev, token]))
+      const inserted = insertLanding(draft, value, cursor, label, true, token)
 
       void gw
         .request<{ path?: string }>('paste.collapse', { text: cleanedText })
@@ -487,14 +585,14 @@ export function useComposerState({ gw, submitRef, sys }: UseComposerStateOptions
 
       return inserted
     },
-    [attachImageToken, gw, pasteClipboardImage, resolveAttachment, setComposerTokens]
+    [attachImageToken, captureDraft, gw, insertLanding, isFresh, pasteClipboardImage, resolveAttachment, setComposerTokens]
   )
 
   const handleTextPaste = useCallback(
     ({ bracketed, cursor, hotkey, text, value }: PasteEvent): MaybePromise<ComposerPasteResult | null> => {
       // Clipboard reads can outlive a focus change, before any gateway RPC starts.
       const destination = captureDestination()
-      const revision = composerRevision.current
+      const draft = captureDraft()
 
       if (hotkey) {
         const preferOsc52 = isRemoteShellSession(process.env)
@@ -516,7 +614,7 @@ export function useComposerState({ gw, submitRef, sys }: UseComposerStateOptions
             })
 
         return readPreferredText.then(async preferredText => {
-          if (!(isCurrentDestination(destination) && revision === composerRevision.current)) {
+          if (!(isCurrentDestination(destination) && isFresh(draft))) {
             return null
           }
 
@@ -531,7 +629,7 @@ export function useComposerState({ gw, submitRef, sys }: UseComposerStateOptions
 
       return handleResolvedPaste({ bracketed: !!bracketed, cursor, text, value })
     },
-    [handleResolvedPaste, pasteClipboardImage, querier]
+    [captureDraft, handleResolvedPaste, isFresh, pasteClipboardImage, querier]
   )
 
   /**
@@ -541,12 +639,13 @@ export function useComposerState({ gw, submitRef, sys }: UseComposerStateOptions
   const appendAttachment = useCallback(
     (attach: (value: string, cursor: number) => Promise<ComposerPasteResult | null>) => {
       const destination = captureDestination()
-      const revision = composerRevision.current
       const current = inputRef.current
 
       void attach(current, current.length).then(next => {
-        if (next && isCurrentDestination(destination) && revision === composerRevision.current) {
-          setInput(next.value)
+        const landed = next && isCurrentDestination(destination) && next.land?.(inputRef.current)
+
+        if (landed) {
+          setInput(landed.value)
         }
       })
     },
@@ -562,7 +661,7 @@ export function useComposerState({ gw, submitRef, sys }: UseComposerStateOptions
     (path: string) =>
       appendAttachment(async (value, cursor) => {
         const destination = captureDestination()
-        const revision = composerRevision.current
+        const draft = captureDraft()
         const { sid } = destination
 
         if (!sid || !path.trim()) {
@@ -571,26 +670,26 @@ export function useComposerState({ gw, submitRef, sys }: UseComposerStateOptions
 
         return resolveAttachment<ImageAttachResponse & { path?: string; mime?: string }>(
           destination,
-          revision,
+          draft,
           (gw.isCanonical
             ? stageImagePath(path, gw, destination)
             : gw.request<ImageAttachResponse & { path?: string }>('image.attach', { path, session_id: sid })
           ).catch((e: Error) => {
-            if (isCurrentDestination(destination) && revision === composerRevision.current) {
+            if (isCurrentDestination(destination) && isFresh(draft)) {
               sys(`error: ${e.message}`)
             }
 
             return null
           }),
-          attached => (attached?.name ? attachImageToken(attached, value, cursor) : null)
+          attached => (attached?.name ? attachImageToken(draft, attached, value, cursor) : null)
         )
       }),
-    [appendAttachment, attachImageToken, gw, resolveAttachment, sys]
+    [appendAttachment, attachImageToken, captureDraft, gw, isFresh, resolveAttachment, sys]
   )
 
   const openEditor = useCallback(async () => {
     const destination = captureDestination()
-    const revision = composerRevision.current
+    const draft = captureDraft()
     const dir = mkdtempSync(join(tmpdir(), 'hermes-'))
     const file = join(dir, 'prompt.md')
     const [cmd, ...args] = resolveEditor()
@@ -614,7 +713,7 @@ export function useComposerState({ gw, submitRef, sys }: UseComposerStateOptions
         return
       }
 
-      if (!(isCurrentDestination(destination) && revision === composerRevision.current)) {
+      if (!(isCurrentDestination(destination) && isFresh(draft))) {
         enqueue(text, text, destination)
 
         return
@@ -626,7 +725,7 @@ export function useComposerState({ gw, submitRef, sys }: UseComposerStateOptions
     } finally {
       rmSync(dir, { force: true, recursive: true })
     }
-  }, [enqueue, input, inputBuf, setInput, setInputBuf, submitRef])
+  }, [captureDraft, enqueue, input, inputBuf, isFresh, setInput, setInputBuf, submitRef])
 
   const actions = useMemo(
     () => ({

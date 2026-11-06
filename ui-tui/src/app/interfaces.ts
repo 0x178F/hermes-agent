@@ -409,6 +409,11 @@ export interface VirtualHistoryState {
 
 export interface ComposerPasteResult {
   cursor: number
+  /**
+   * Re-place this insertion on the composer value it is about to be written
+   * to; null once the draft it was made for was edited away.
+   */
+  land?: (current: string, caret?: number) => ComposerPasteResult | null
   value: string
 }
 
