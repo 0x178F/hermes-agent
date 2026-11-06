@@ -47,9 +47,15 @@ def _on_session_start(**kwargs):
     return None
 
 
+def _hosted_tool(args, **kwargs):
+    return "ok"
+
+
 def register(ctx):
     ctx.register_memory_provider(HostedProv())
     ctx.register_hook("on_session_start", _on_session_start)
+    ctx.register_tool(name="hostedprov_probe", toolset="hostedprov", handler=_hosted_tool,
+                      schema={"name": "hostedprov_probe", "description": "probe", "parameters": {"type": "object", "properties": {}}})
 """
 
 _SCHEMA = """
@@ -110,11 +116,16 @@ def test_a_profile_hook_runs_in_the_host_and_its_host_is_stopped(hosted_home):
     assert seen["name"] == "work" and seen["pid"] != os.getpid()
     hosts = [getattr(m, "_plugin_host_instance", None) for m in plugins_mod._known_plugin_managers()]
     assert not any(h is not None and h.alive for h in hosts)
-    # The hook-only load's on_session_start proxy pointed at the stopped host: it was dropped too.
+    # Everything the hook-only load registered proxied into the stopped host: its hook AND its tool
+    # are gone from the new profile's manager and the tool registry.
     from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from tools.registry import registry
     token = set_hermes_home_override(str(work))
     try:
-        assert not plugins_mod.get_plugin_manager()._hooks.get("on_session_start")
+        manager = plugins_mod.get_plugin_manager()
+        assert not manager._hooks.get("on_session_start")
+        assert registry.get_entry("hostedprov_probe", scope=manager.scope_key) is None
+        assert not manager._ownership_ledger.get("hostedprov")
     finally:
         reset_hermes_home_override(token)
 

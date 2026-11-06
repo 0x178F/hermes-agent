@@ -10,6 +10,7 @@ must never shadow a shipped provider. Changing this order is a breaking change.
 from __future__ import annotations
 
 import ast
+import contextlib
 import hashlib
 import importlib.metadata
 import importlib.util
@@ -17,7 +18,7 @@ import logging
 import sys
 from pathlib import Path
 from types import SimpleNamespace
-from typing import List, Optional, Tuple, TYPE_CHECKING
+from typing import Callable, Iterator, List, Optional, Tuple, TYPE_CHECKING
 
 from hermes_cli.config import cfg_get
 from plugins import plugin_loader as _loader
@@ -492,6 +493,26 @@ class _ProviderCollector:
             manifest = PluginManifest(name=self.name, key=self.name)
             self._context = PluginContext(manifest, get_plugin_manager())
         return self._context
+
+
+@contextlib.contextmanager
+def provider_registration_scope(name: str) -> Iterator[Callable[[], None]]:
+    """Yield a ``release()`` that disposes every registration provider ``name``'s loads made on the
+    active profile's plugin manager since the block began: hooks, tools, and the rest
+    ``_ProviderCollector`` forwards. For a one-shot load whose plugin host is about to stop, so
+    nothing is left proxying into a dead host; the provider's next real load registers them again."""
+    from hermes_cli.plugins import get_plugin_manager
+
+    manager = get_plugin_manager()
+    with manager._discovery_lock:
+        before = {id(r) for r in manager._ownership_ledger.get(name, ())}
+
+    def release() -> None:
+        with manager._discovery_lock:
+            made = [r for r in manager._ownership_ledger.get(name, ()) if id(r) not in before]
+            manager._dispose_registrations(made)
+
+    yield release
 
 
 def _get_active_memory_provider() -> Optional[str]:
