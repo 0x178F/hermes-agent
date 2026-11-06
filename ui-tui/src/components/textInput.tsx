@@ -772,8 +772,11 @@ type InputHandler = (inp: string, k: Key, event: InputEvent) => void
 
 interface PasteInsert {
   cursor: number
-  /** Re-place the insertion on the current value; null when it no longer belongs there. */
-  land?: (current: string, caret: number) => PasteInsert | null
+  /**
+   * Re-place the insertion on the owner's live value, which can be ahead of
+   * this input's; null when it no longer belongs there. Commit the result at once.
+   */
+  land?: (view: { caret: number; value: string }) => PasteInsert | null
   value: string
 }
 
@@ -1245,7 +1248,7 @@ export function TextInput({
 
           // Only other pastes landing since: this one still belongs in the draft.
           if (editVersionRef.current - startVersion === pasteLandingsRef.current - startLandings) {
-            const landed = result.land ? result.land(vRef.current, curRef.current) : result
+            const landed = result.land ? result.land({ caret: curRef.current, value: vRef.current }) : result
 
             if (landed) {
               pasteLandingsRef.current += 1

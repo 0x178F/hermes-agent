@@ -178,3 +178,55 @@ it('a user edit while an image paste is in flight still drops it and detaches th
   expect(h.composer.state.input).not.toContain('Image')
   expect(detached(h)).toEqual(['/a.png'])
 })
+
+it('a second paste in the middle of the draft lands right after the first, not one landing further on', async () => {
+  const h = mount()
+  await settle()
+  h.composer.actions.setInput('abcdef')
+  await settle()
+  // Caret after `ab`.
+  h.stdin.send('\x1b[D\x1b[D\x1b[D\x1b[D')
+  await settle()
+  h.paste('X')
+  await settle()
+  expect(h.composer.state.input).toBe('abXcdef')
+  h.paste('Y')
+  await settle()
+
+  expect(h.composer.state.input).toBe('abXYcdef')
+})
+
+// Lets every promise continuation run without yielding a macrotask, so Ink
+// cannot re-render (and hand the input line the new draft) in between.
+const microtasks = async () => {
+  for (let i = 0; i < 50; i++) {
+    await Promise.resolve()
+  }
+}
+
+it('a slash attach and a path paste replying before a re-render both keep their image', async () => {
+  for (const order of [
+    [0, 1],
+    [1, 0]
+  ]) {
+    const h = mount()
+    await settle()
+    h.composer.actions.attachImagePath('/c.png')
+    h.paste('/d.png')
+    await settle()
+    expect(h.held.map(x => x.path)).toEqual(['/c.png', '/d.png'])
+
+    // The first reply lands in full before the second is released, with no
+    // render between them: the input line still shows the draft before both.
+    for (const i of order) {
+      h.held[i]!.release()
+      await microtasks()
+    }
+
+    await settle()
+
+    expect(h.composer.state.input).toBe('[[ Image 1 ]] [[ Image 2 ]]')
+    expect(imagePaths(h).sort()).toEqual(['/c.png', '/d.png'])
+    expect(detached(h)).toEqual([])
+  }
+})

@@ -26,6 +26,7 @@ import { placeInputCursor } from './inputSelectionStore.js'
 import type {
   ComposerPasteResult,
   ComposerToken,
+  ComposerView,
   MaybePromise,
   StateSetter,
   UseComposerStateOptions,
@@ -123,6 +124,8 @@ export function looksLikeDroppedPath(text: string): boolean {
 /** The draft an in-flight paste or attach was started on. */
 interface DraftMark {
   revision: number
+  /** How many of this revision's landings the result's base value already holds. */
+  seen: number
 }
 
 export function useComposerState({ gw, submitRef, sys }: UseComposerStateOptions): UseComposerStateResult {
@@ -133,7 +136,7 @@ export function useComposerState({ gw, submitRef, sys }: UseComposerStateOptions
   const composerRevision = useRef(0)
   // Inserts results made on the current revision, in landing order, so a
   // later result moves its insertion point past the ones that landed first.
-  const landings = useRef<Array<{ at: number; len: number }>>([])
+  const landings = useRef<Array<{ at: number; len: number; value: string }>>([])
   // The value a result's landing is about to write, so setInput knows it as its own.
   const landingValue = useRef<null | string>(null)
   // Tokens added by a result that has not landed in the text yet.
@@ -144,10 +147,17 @@ export function useComposerState({ gw, submitRef, sys }: UseComposerStateOptions
     landings.current = []
   }, [])
 
-  const captureDraft = useCallback(
-    (): DraftMark => ({ revision: composerRevision.current }),
-    []
-  )
+  // `base` is the value the result computes its cursor against. The input
+  // line can hand over a value that has not caught up with landings written
+  // straight to the composer yet, so match it rather than count every landing.
+  const captureDraft = useCallback((base: string): DraftMark => {
+    const seen =
+      base === inputRef.current
+        ? landings.current.length
+        : landings.current.findLastIndex(landing => landing.value === base) + 1
+
+    return { revision: composerRevision.current, seen }
+  }, [])
 
   const isFresh = useCallback((draft: DraftMark) => draft.revision === composerRevision.current, [])
 
@@ -322,8 +332,9 @@ export function useComposerState({ gw, submitRef, sys }: UseComposerStateOptions
   /**
    * A result inserting `text` at `cursor` of the draft it started on. Other
    * results may land on that draft first, so `land` re-places the insertion on
-   * the value it is about to be written to, after those earlier insertions, and
-   * refuses once anything else edited the draft. `spaced` pads it off its
+   * the composer's live value, after the insertions that landed since this
+   * result started, and refuses once anything else edited the draft. The
+   * caller writes the returned value straight away. `spaced` pads it off its
    * neighbours like a chip; raw text goes in verbatim.
    */
   const insertLanding = useCallback(
@@ -335,7 +346,7 @@ export function useComposerState({ gw, submitRef, sys }: UseComposerStateOptions
         unlanded.current.add(token)
       }
 
-      const land = (current: string, caret = current.length): ComposerPasteResult | null => {
+      const land = (view?: ComposerView): ComposerPasteResult | null => {
         if (token) {
           unlanded.current.delete(token)
         }
@@ -349,20 +360,31 @@ export function useComposerState({ gw, submitRef, sys }: UseComposerStateOptions
           return null
         }
 
-        // After whatever landed at or before this point first: chips read in the
-        // order they were numbered, which is the order their images reach the model.
+        // The caller's view can lag the composer (a slash attach wrote it
+        // before the input line re-rendered); the composer's value is the draft.
+        const current = inputRef.current
+
+        // After whatever landed at or before this point since this result
+        // started: chips read in the order they were numbered, which is the
+        // order their images reach the model. Landings its base already held
+        // are part of `cursor`.
         const at = Math.min(
           current.length,
-          landings.current.reduce((pos, prior) => (prior.at <= pos ? pos + prior.len : pos), cursor)
+          landings.current
+            .slice(draft.seen)
+            .reduce((pos, prior) => (prior.at <= pos ? pos + prior.len : pos), cursor)
         )
 
         const next = insert(current, at)
         const len = next.value.length - current.length
 
-        landings.current.push({ at, len })
+        landings.current.push({ at, len, value: next.value })
         landingValue.current = next.value
 
-        // The caret stays with the user's text when the insert landed behind it.
+        // The caret stays with the user's text when the insert landed behind it;
+        // a caret measured on a stale view means nothing here, so it follows the insert.
+        const caret = view && view.value === current ? view.caret : at
+
         return { cursor: Math.max(caret, at) + len, value: next.value }
       }
 
@@ -459,7 +481,7 @@ export function useComposerState({ gw, submitRef, sys }: UseComposerStateOptions
   const pasteClipboardImage = useCallback(
     async (value: string, cursor: number, quiet: boolean): Promise<ComposerPasteResult | null> => {
       const destination = captureDestination()
-      const draft = captureDraft()
+      const draft = captureDraft(value)
       const { sid } = destination
 
       if (!sid) {
@@ -500,7 +522,7 @@ export function useComposerState({ gw, submitRef, sys }: UseComposerStateOptions
   const handleResolvedPaste = useCallback(
     async ({ bracketed, cursor, text, value }: Omit<PasteEvent, 'hotkey'>): Promise<ComposerPasteResult | null> => {
       const destination = captureDestination()
-      const draft = captureDraft()
+      const draft = captureDraft(value)
       const current = () => isCurrentDestination(destination) && isFresh(draft)
       const cleanedText = stripTrailingPasteNewlines(text)
 
@@ -592,7 +614,7 @@ export function useComposerState({ gw, submitRef, sys }: UseComposerStateOptions
     ({ bracketed, cursor, hotkey, text, value }: PasteEvent): MaybePromise<ComposerPasteResult | null> => {
       // Clipboard reads can outlive a focus change, before any gateway RPC starts.
       const destination = captureDestination()
-      const draft = captureDraft()
+      const draft = captureDraft(value)
 
       if (hotkey) {
         const preferOsc52 = isRemoteShellSession(process.env)
@@ -642,7 +664,7 @@ export function useComposerState({ gw, submitRef, sys }: UseComposerStateOptions
       const current = inputRef.current
 
       void attach(current, current.length).then(next => {
-        const landed = next && isCurrentDestination(destination) && next.land?.(inputRef.current)
+        const landed = next && isCurrentDestination(destination) && next.land?.()
 
         if (landed) {
           setInput(landed.value)
@@ -661,7 +683,7 @@ export function useComposerState({ gw, submitRef, sys }: UseComposerStateOptions
     (path: string) =>
       appendAttachment(async (value, cursor) => {
         const destination = captureDestination()
-        const draft = captureDraft()
+        const draft = captureDraft(value)
         const { sid } = destination
 
         if (!sid || !path.trim()) {
@@ -689,7 +711,7 @@ export function useComposerState({ gw, submitRef, sys }: UseComposerStateOptions
 
   const openEditor = useCallback(async () => {
     const destination = captureDestination()
-    const draft = captureDraft()
+    const draft = captureDraft(inputRef.current)
     const dir = mkdtempSync(join(tmpdir(), 'hermes-'))
     const file = join(dir, 'prompt.md')
     const [cmd, ...args] = resolveEditor()
